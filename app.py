@@ -1,27 +1,21 @@
 import streamlit as st
 import pandas as pd
-import json
 import random
+from streamlit_mic_recorder import speech_to_text
 
 # --- ページ設定 ---
 st.set_page_config(page_title="AI配車アシスタント - デモ", layout="wide")
 
 st.title("🚛 配車最適化AIアシスタント (Prototype)")
-st.markdown("""
-このデモは、**「ベテラン配車担当者の頭の中（判断ロジック）」**をAIに移植し、
-自然言語の指示で最適なルート組みを提案させるプロトタイプです。
-""")
+st.markdown("現場の状況とスタッフの相性を考慮し、最適なルートを瞬時に提案します。")
 
 # --- 1. データ生成セクション (架空データの準備) ---
 def generate_dummy_data():
-    # 社員データ
     staff_data = [
         {"名前": "佐藤(A)", "スキル": "ベテラン", "性格": "慎重・確実", "苦手": "特になし", "希望": "件数を稼ぎたい"},
         {"名前": "鈴木(B)", "スキル": "中堅", "性格": "社交的", "苦手": "事務作業", "希望": "遠距離は避けたい"},
         {"名前": "田中(C)", "スキル": "新人", "性格": "内向的", "苦手": "厳しい管理人", "希望": "メンター同行希望"}
     ]
-    
-    # 現場データ
     locations = ["青葉区マンション", "中央ビル", "港北倉庫", "緑区役所", "南ショッピングモール"]
     difficulties = ["低", "中", "高(要交渉)"]
     stress_levels = ["普通", "高い(管理人が厳しい)", "低い"]
@@ -34,83 +28,62 @@ def generate_dummy_data():
             "対人ストレス": random.choice(stress_levels),
             "所要時間(分)": random.choice([30, 60, 90, 120])
         })
-    
     return pd.DataFrame(staff_data), pd.DataFrame(site_data)
 
-# セッション状態にデータを保持
 if 'df_staff' not in st.session_state:
     st.session_state.df_staff, st.session_state.df_site = generate_dummy_data()
 
-# --- サイドバー: データ確認と設定 ---
-with st.sidebar:
-    st.header("🛠️ 設定・データ確認")
-    openai_api_key = st.text_input("OpenAI API Key (未入力なら模擬モード)", type="password")
+# --- 2. データの可視化 (Expanderで開閉可能に) ---
+with st.expander("📋 【参照データ】現在の要員リストと現場リストを見る (タップして展開)"):
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("現在の要員 (Staff)")
+        st.dataframe(st.session_state.df_staff, hide_index=True)
+    with col2:
+        st.subheader("本日の現場 (Sites)")
+        st.dataframe(st.session_state.df_site, hide_index=True)
     
-    st.subheader("📋 現在の要員リスト")
-    st.dataframe(st.session_state.df_staff, hide_index=True)
-    
-    st.subheader("📍 今日の現場リスト")
-    st.dataframe(st.session_state.df_site, hide_index=True)
-    
-    if st.button("データを再生成する"):
+    if st.button("🔄 データをランダム更新"):
         st.session_state.df_staff, st.session_state.df_site = generate_dummy_data()
         st.rerun()
 
-# --- 2. AIロジック定義 (ここが「ベテランの脳内」) ---
-def get_ai_response(user_instruction, df_staff, df_site, api_key):
-    # データフレームをテキスト(JSON/CSV)に変換してプロンプトに埋め込む
-    staff_text = df_staff.to_json(orient="records", force_ascii=False)
-    site_text = df_site.to_json(orient="records", force_ascii=False)
+# --- 3. AIロジック ---
+def get_ai_response(user_instruction, api_key):
+    # データフレームをテキスト化
+    staff_text = st.session_state.df_staff.to_json(orient="records", force_ascii=False)
+    site_text = st.session_state.df_site.to_json(orient="records", force_ascii=False)
 
-    # システムプロンプト：ベテラン配車係の役割定義
     system_prompt = f"""
-    あなたは熟練の配車担当者です。以下の「社員データ」と「現場データ」をもとに、
-    ユーザーの指示に従って最適な人員配置（ルート組み）を提案してください。
+    あなたは熟練の配車担当者です。以下のデータを元に、指示に従って人員配置を行ってください。
     
-    # 判断基準
-    1. 新人や内向的な社員には「対人ストレス」が高い現場（管理人が厳しい等）を避ける。
-    2. ベテランには難易度が高い現場や、件数を多く割り当てる。
-    3. ユーザーからの特記事項（体調不良など）を最優先する。
-    
-    # 出力形式
-    提案は以下のフォーマットで行ってください。
-    - **配置案の概要**: なぜこの配置にしたかの全体的な理由
-    - **個別割り当て**:
-      - [社員名]: [担当現場名] (理由: ...)
+    # ルール
+    - 新人(田中)には「対人ストレス:高い」「難易度:高」を避ける。
+    - ベテラン(佐藤)には難所を優先的に割り当てる。
+    - ユーザーの指示(体調、天候など)を最優先する。
     
     # データ
-    [社員リスト]: {staff_text}
-    [現場リスト]: {site_text}
+    [社員]: {staff_text}
+    [現場]: {site_text}
     """
 
     if not api_key:
-        # APIキーがない場合の模擬レスポンス (Mock)
         import time
-        time.sleep(2) # 思考時間を演出
+        time.sleep(1.5)
         return f"""
-**(模擬モードでの回答です)**
-承知いたしました。ご指示の「{user_instruction}」を考慮し、以下の配置を提案します。
+**(模擬モード回答)**
+指示: 「{user_instruction}」に基づき配置しました。
 
-**配置案の概要:**
-{user_instruction[:10]}... という点を重視し、田中(C)さんには心理的負担の少ない現場を、佐藤(A)さんには難所を任せる構成にしました。
-
-**個別割り当て:**
-* **佐藤(A)**: 中央ビル、緑区役所
-    * *理由*: 難易度「高」の現場ですが、ベテランの佐藤さんなら確実に対応可能です。
-* **鈴木(B)**: 港北倉庫、南ショッピングモール
-    * *理由*: 移動距離を考慮し、近隣エリアでまとめました。
-* **田中(C)**: 青葉区マンション
-    * *理由*: 内向的な性格を考慮し、対人ストレスが「低い」現場を選定しました。指示通り無理のない配置です。
+**🚚 配置案:**
+* **佐藤(A)**: 中央ビル (難易度:高) - ベテランの対応力を活かします。
+* **鈴木(B)**: 港北倉庫、南モール - 移動効率重視でセットにしました。
+* **田中(C)**: 青葉区マンション - 管理人が厳しくないため、新人の田中さんでも安心です。
         """
-    
     else:
-        # 実際にOpenAI APIを叩く
         try:
             from openai import OpenAI
             client = OpenAI(api_key=api_key)
-            
             response = client.chat.completions.create(
-                model="gpt-3.5-turbo", # コスト重視で3.5、精度重視ならgpt-4
+                model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_instruction}
@@ -119,40 +92,67 @@ def get_ai_response(user_instruction, df_staff, df_site, api_key):
             )
             return response.choices[0].message.content
         except Exception as e:
-            return f"エラーが発生しました: {str(e)}"
+            return f"エラー: {str(e)}"
 
-# --- 3. メインチャットインターフェース ---
-st.subheader("💬 AI配車アシスタントへの指示")
+# --- 4. メインインターフェース ---
+st.divider()
 
-# チャット履歴の初期化
-if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "おはようございます。本日の配置はどうしますか？「田中さんは今日メンタル不調なので優しめで」のように指示してください。"}]
+# サイドバーにAPIキー設定
+with st.sidebar:
+    openai_api_key = st.text_input("OpenAI API Key", type="password")
+    st.info("APIキーがない場合は模擬モードで動きます")
 
 # チャット履歴の表示
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "assistant", "content": "おはようございます。本日の配置指示をどうぞ。（音声入力も可能です）"}]
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
-# ユーザー入力
-if prompt := st.chat_input("指示を入力してください..."):
-    # ユーザーの入力を表示
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.write(prompt)
+# --- 入力エリア (ワンタップボタン & 音声 & テキスト) ---
+st.write("### 👇 指示を入力 (タップまたは音声)")
 
-    # AIの思考中表示
+# ワンタップ入力ボタン
+col_btn1, col_btn2, col_btn3 = st.columns(3)
+user_input = None
+
+with col_btn1:
+    if st.button("☔️ 雨天・安全重視モード"):
+        user_input = "今日は雨だから、全員移動距離を短くして、安全優先のルートで組んで。"
+with col_btn2:
+    if st.button("🔰 新人(田中)ケアモード"):
+        user_input = "田中くんはまだ不慣れだから、一番簡単な現場1件だけにして。残りはベテランでカバーして。"
+with col_btn3:
+    if st.button("⚡️ トラブル対応モード"):
+        user_input = "佐藤さんが急なクレーム対応で遅れる。佐藤さんの現場を1つ減らして、鈴木さんに回して。"
+
+# 音声入力
+st.write("🎙 **音声で指示する:**")
+audio_text = speech_to_text(language='ja', start_prompt="録音開始 (押して喋る)", stop_prompt="録音終了 (もう一度押す)", just_once=True)
+
+if audio_text:
+    user_input = audio_text
+
+# テキスト入力 (チャットバー)
+chat_input_text = st.chat_input("キーボードで指示を入力...")
+if chat_input_text:
+    user_input = chat_input_text
+
+# --- 処理実行 ---
+if user_input:
+    # ユーザーの発言を表示
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.write(user_input)
+
+    # AIの回答生成
     with st.chat_message("assistant"):
-        with st.spinner("ベテランの思考ロジックで検討中..."):
-            response = get_ai_response(
-                prompt, 
-                st.session_state.df_staff, 
-                st.session_state.df_site, 
-                openai_api_key
-            )
+        with st.spinner("ベテランAIが思考中..."):
+            response = get_ai_response(user_input, openai_api_key)
             st.write(response)
-            
-            # 「裏側のプロンプト」を見せる（デモ効果用）
-            with st.expander("👀 AIが見ているデータと指示（プロンプトの中身）"):
-                st.code(f"User Instruction: {prompt}\n\nData Context Used:\nStaff: {len(st.session_state.df_staff)} records\nSites: {len(st.session_state.df_site)} records", language="yaml")
     
     st.session_state.messages.append({"role": "assistant", "content": response})
+    
+    # 処理が終わったらリランして表示を更新（ボタンの連続押し等を防ぐため）
+    st.rerun()
